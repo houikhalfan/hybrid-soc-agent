@@ -1,0 +1,228 @@
+# ============================================================
+# SOC pipeline configuration — real-traffic (Zeek + Suricata) version.
+#
+# Every network-specific value (IP ranges, log paths, thresholds, working
+# hours) lives here, not in code. Values marked PLACEHOLDER were never
+# computed from real traffic — they are starting points to be recalibrated
+# once the lab (or production) network has produced logs. See the
+# "calibration" block at the bottom for which ones train_all.py is allowed
+# to overwrite automatically, and which stay manual.
+# ============================================================
+
+network:
+  # CIDR ranges for the VM lab. Add company ranges here later — nothing
+  # in the code should ever reference an IP literal directly.
+  attacker_ranges:
+    - "192.168.10.0/24"      # Kali box lives here (192.168.10.10)
+  victim_ranges:
+    - "192.168.20.0/24"      # victim lives here (192.168.20.10)
+  # Union of ranges considered "our network" (used later for fwd/bwd
+  # orientation if a feature ever needs it). Defaults to attacker+victim.
+  internal_ranges:
+    - "192.168.10.0/24"
+    - "192.168.20.0/24"
+  # Host-only network linking the sensor VM to the Windows host running
+  # FastAPI/n8n/dashboard. Sensor->host flow/alert push and host->sensor
+  # block-agent calls both travel over this link.
+  host_only_network: "192.168.56.0/24"
+
+# ------------------------------------------------------------------
+# Deployment topology: logs are produced and parsed ON THE SENSOR VM
+# (sensor_agent/*). The host (this machine, Windows) runs FastAPI,
+# correlation, the models, n8n and the dashboard. The two sides only
+# ever talk over the host-only network below.
+# ------------------------------------------------------------------
+deployment:
+  host:
+    api_bind_host: "0.0.0.0"
+    api_bind_port: 8000
+    # How the sensor reaches this host's FastAPI ingestion endpoints.
+    api_url_from_sensor: "http://192.168.56.1:8000"   # PLACEHOLDER — host's host-only IP
+  sensor:
+    # Sensor's own address on the host-only network, and the port its
+    # block agent listens on. The host uses this to call back for
+    # block/unblock actions (containment runs on the gateway, not here).
+    host_only_ip: "192.168.56.10"        # PLACEHOLDER — set to the sensor's host-only IP
+    block_agent_port: 8787
+  # Shared secret both sides must present to each other (sensor -> host
+  # ingestion, host -> sensor block agent). Same secret reused for both
+  # directions for now since it's a single trusted lab link; split into
+  # two secrets before this ever leaves the lab.
+  shared_secret: "CHANGE_ME"           # PLACEHOLDER
+
+sensors:
+  # Local paths ON THE SENSOR VM — only sensor_agent/* code reads these.
+  zeek:
+    # Zeek configured with JSON logs (LogAscii::use_json = T) and the
+    # community-id-logging policy script loaded (adds `community_id`
+    # to conn.log).
+    conn_log_path: "/opt/zeek/logs/current/conn.log"
+    # Other Zeek logs are not consumed yet, but the paths are declared so
+    # new adapters can be wired in without touching this file again.
+    dns_log_path: "/opt/zeek/logs/current/dns.log"
+    http_log_path: "/opt/zeek/logs/current/http.log"
+    ssl_log_path: "/opt/zeek/logs/current/ssl.log"
+    ssh_log_path: "/opt/zeek/logs/current/ssh.log"
+  suricata:
+    # eve.json with `community-id: true` enabled under the eve-log
+    # outputs config. Only event_type == "alert" lines are consumed —
+    # Suricata is an alert/signature source here, not a second flow
+    # source (Zeek conn.log is the only flow source, to avoid
+    # double-counting the same connection twice).
+    eve_json_path: "/var/log/suricata/eve.json"
+    event_types_consumed: ["alert"]
+
+ingestion:
+  # FastAPI endpoints (on the host) the sensor's push_client.py sends
+  # batches of common-schema flow records and Suricata alerts to.
+  flow_endpoint: "/ingest/flows"
+  alert_endpoint: "/ingest/alerts"
+  batch_size: 200
+  push_interval_seconds: 5
+
+tailing:
+  # How often log_tailer.py polls the log files for new lines, in seconds.
+  poll_interval_seconds: 5
+  # Where log_tailer.py persists its "last read offset" per file (on the
+  # sensor), so a restart doesn't re-ingest or lose lines.
+  offset_store_path: "state/log_offsets.json"
+
+join:
+  # Primary join key linking a Zeek conn.log flow record to a Suricata
+  # alert for the same connection. Requires community-id-logging enabled
+  # on Zeek and community-id: true in Suricata's eve-log config.
+  primary_key: "community_id"
+  # Used only when community_id is missing on one side (e.g. a protocol
+  # Suricata doesn't hash, or community-id logging not yet enabled).
+  fallback: "five_tuple_time"
+  fallback_time_tolerance_seconds: 2
+
+storage:
+  # Rolling flow + alert store, written by the host's /ingest/* endpoints,
+  # read by correlation_engine.py and the training scripts.
+  sqlite_path: "data_real/soc_pipeline.db"
+
+correlation:
+  window_seconds: 60   # anchored dynamic window size, same semantics as today
+
+# ------------------------------------------------------------------
+# Detection thresholds. All PLACEHOLDER until recalibrated on real
+# traffic. train_all.py's calibration block below says which of these
+# it is allowed to recompute automatically from the configured normal
+# traffic window.
+# ------------------------------------------------------------------
+rules:
+  port_scan:
+    distinct_port_threshold: 15          # PLACEHOLDER
+    # Zeek conn_state codes treated as "no real response" — the actual
+    # signature of a scan attempt, not just "a connection happened".
+    scan_like_conn_states: ["S0", "REJ", "RSTOS0", "RSTRH"]
+  brute_force:
+    attempt_threshold: 8                 # PLACEHOLDER
+    sensitive_ports: [21, 22, 23, 445, 1433, 3306, 3389]
+    # Services checked in addition to the port list, so e.g. SSH on a
+    # non-standard port is still caught via Zeek's service detection.
+    sensitive_services: ["ssh", "ftp", "mysql", "rdp"]
+  volume:
+    large_flow_bytes_threshold: 1000000  # PLACEHOLDER (bytes, fwd direction)
+  duration:
+    long_connection_seconds_threshold: 300   # PLACEHOLDER
+  beaconing:
+    min_windows: 4            # same semantics as the CICIDS-era engine
+    max_avg_flows_per_window: 3
+    max_interval_cv: 0.5
+
+baseline:
+  maturity_threshold: 50               # PLACEHOLDER (# observations for full confidence)
+  severity_zscore_threshold: 3.0       # PLACEHOLDER
+  min_host_confidence_for_baseline: 0.3
+  # Common-schema numeric columns the per-host baseline profiles.
+  features:
+    - "duration"
+    - "orig_pkts"
+    - "resp_pkts"
+    - "orig_bytes"
+    - "resp_bytes"
+    - "bytes_per_sec"
+    - "pkts_per_sec"
+
+isolation_forest:
+  contamination: 0.05        # PLACEHOLDER
+  n_estimators: 200
+  random_state: 42
+
+risk_score:
+  weights:
+    isolation_forest: 0.40
+    rules: 0.30
+    baseline: 0.30
+  class_boundaries:
+    moyen_min: 30
+    eleve_min: 60
+    critique_min: 80
+
+# ------------------------------------------------------------------
+# Training: no labels. A period of traffic is "normal" because this
+# config says so, not because anything tagged it. train_all.py reads
+# this window, fits Isolation Forest + the per-host baseline on it.
+# ------------------------------------------------------------------
+training:
+  normal_traffic_window:
+    start: "2026-01-01T00:00:00Z"   # PLACEHOLDER — set before running train_all.py
+    end: "2026-01-01T00:00:00Z"     # PLACEHOLDER — set before running train_all.py
+  model_output_dir: "data_real/models"
+
+# ------------------------------------------------------------------
+# Attack typing without a classifier (see attack_typing.py).
+# Priority: Suricata signature -> rule that fired -> "Unknown anomaly".
+# ------------------------------------------------------------------
+attack_typing:
+  # Confidence assigned when a Suricata signature matched (deterministic,
+  # not a probability — kept high and fixed).
+  suricata_match_confidence: 0.90
+  # Confidence assigned when only a rule-engine flag fired (heuristic).
+  rule_match_confidence: 0.55
+  # Fallback MITRE technique when nothing more specific is known.
+  unknown_mitre_technique: "Non cartographié"
+  # Suricata alert.category -> MITRE technique, used only when the
+  # matched signature's own metadata doesn't carry a MITRE ID.
+  suricata_category_to_mitre:
+    "Attempted Administrator Privilege Gain": "T1068 - Exploitation for Privilege Escalation"
+    "Attempted Denial of Service": "T1498 - Network Denial of Service"
+    "Attempted Information Leak": "T1005 - Data from Local System"
+    "Attempted User Privilege Gain": "T1078 - Valid Accounts"
+    "A Network Trojan was Detected": "T1071 - Application Layer Protocol (C2)"
+    "Web Application Attack": "T1190 - Exploit Public-Facing Application"
+  # Rule-engine flag -> (attack type label, MITRE technique), used when
+  # no Suricata signature fired for the incident.
+  rule_to_type_and_mitre:
+    port_scan_triggered: ["PortScan", "T1046 - Network Service Discovery"]
+    brute_force_triggered: ["BruteForce", "T1110 - Brute Force"]
+    large_flow_triggered: ["LargeTransfer", "T1041 - Exfiltration Over C2 Channel"]
+    long_connection_triggered: ["LongConnection", "Non cartographié"]
+    beaconing_triggered: ["Beaconing", "T1071 - Application Layer Protocol (C2)"]
+
+operational:
+  working_hours:
+    start: "08:00"
+    end: "19:00"
+    timezone: "Africa/Casablanca"
+    days: ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+# ------------------------------------------------------------------
+# What train_all.py is allowed to recompute automatically from the
+# normal_traffic_window above, versus what stays a manual edit here.
+# Not used by any script yet (training is out of scope for now) —
+# documents intent so this file doesn't silently drift from train_all.py
+# once it exists.
+# ------------------------------------------------------------------
+calibration:
+  auto_computed_from_normal_window:
+    - "isolation_forest.contamination (left as config default unless overridden)"
+    - "baseline per-host mean/std profiles"
+  manual_only:
+    - "rules.port_scan.distinct_port_threshold"
+    - "rules.brute_force.attempt_threshold"
+    - "rules.volume.large_flow_bytes_threshold"
+    - "rules.duration.long_connection_seconds_threshold"
+    - "risk_score.weights"
